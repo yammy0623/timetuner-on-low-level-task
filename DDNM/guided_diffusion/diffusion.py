@@ -22,6 +22,19 @@ import random
 from scipy.linalg import orth
 
 
+# class CustomDataset(data.Dataset):
+#     def __init__(self,):
+#         pass
+
+#     def __getitem__(self, idx):
+#         image_tensor = 
+#         label_tensor = ...  # 加載標籤
+#         return {'image': image_tensor, 'label': label_tensor}
+
+#     def __len__(self):
+#         return len(self.data)
+
+
 def get_gaussian_noisy_img(img, noise_level):
     return img + torch.randn_like(img).cuda() * noise_level
 
@@ -113,7 +126,7 @@ class Diffusion(object):
         elif self.model_var_type == "fixedsmall":
             self.logvar = posterior_variance.clamp(min=1e-20).log()
 
-    def sample(self, simplified):
+    def sample(self, simplified, timetuner):
         cls_fn = None
         if self.config.model.type == 'simple':
             model = Model(self.config)
@@ -191,22 +204,97 @@ class Diffusion(object):
 
                 cls_fn = cond_fn
 
-        if simplified:
-            print('Run Simplified DDNM, without SVD.',
-                  f'{self.config.time_travel.T_sampling} sampling steps.',
-                  f'travel_length = {self.config.time_travel.travel_length},',
-                  f'travel_repeat = {self.config.time_travel.travel_repeat}.',
-                  f'Task: {self.args.deg}.'
-                 )
-            self.simplified_ddnm_plus(model, cls_fn)
+
+
+        if timetuner == "train":
+            args, config, betas = self.args, self.config, self.betas
+            print("timetuner train")
+            from time_tuner import NoiseScheduleVP, model_wrapper, TimeTuner
+
+            # 1. Define the noise schedule.
+            noise_schedule = NoiseScheduleVP(schedule='discrete', betas=betas)
+
+            ## 2. Convert your discrete-time `model` to the continuous-time
+            ## noise prediction model. Here is an example for a diffusion model
+            ## `model` with the noise prediction type.
+            guidance_scale=1.
+            guidance_type='uncond'
+            classifier_fcn=cls_fn
+            model_kwargs=None
+            classifier_kwargs=None
+
+            model_fn_continuous = model_wrapper(
+                model,
+                noise_schedule,
+                model_type='noise',
+                guidance_type=guidance_type,
+                guidance_scale=guidance_scale,
+                classifier_fn=classifier_fcn,
+                model_kwargs=model_kwargs,
+                classifier_kwargs=classifier_kwargs,
+            )
+
+            # 3. Define TimeTuner for optimizing, together with the DDIM sampler.
+            time_tuner = TimeTuner(model_fn_continuous, noise_schedule)
+            step_fn = time_tuner.ddim_step_fn
+            step_fn_kwargs = dict(eta=args.eta)
+            tune_type = 'sequential'
+            lr=2e-3
+            total_iters=10
+
+            # 4. Optimize the preset timesteps with NFE = 10.
+            
+            def seed_worker(worker_id):
+                worker_seed = args.seed % 2 ** 32
+                np.random.seed(worker_seed)
+                random.seed(worker_seed)
+
+            g = torch.Generator()
+            g.manual_seed(args.seed)
+            train_dataset, test_dataset = get_dataset(args, config)
+            train_loader = data.DataLoader(
+                train_dataset,
+                batch_size=config.sampling.batch_size,
+                shuffle=True,
+                num_workers=config.data.num_workers,
+                worker_init_fn=seed_worker,
+                generator=g,
+            )
+            
+
+            t_ratios = time_tuner.optimize_timesteps(data_loader=train_loader,
+                                                    step_fn=step_fn,
+                                                    num_steps=args.step_nums,
+                                                    timesteps=None,
+                                                    tune_type=tune_type,
+                                                    lr=lr,
+                                                    total_iters=total_iters,
+                                                    verbose=True,
+                                                    **step_fn_kwargs)
+            print(t_ratios)
+            torch.save(t_ratios, f"./t_ratios_{args.step_nums}.pt")
+            
+        elif timetuner == "val":
+            print("timetuner val")
+            t_ratios = torch.load(f"t_ratios_{args.step_nums}.pt")
+
         else:
-            print('Run SVD-based DDNM.',
-                  f'{self.config.time_travel.T_sampling} sampling steps.',
-                  f'travel_length = {self.config.time_travel.travel_length},',
-                  f'travel_repeat = {self.config.time_travel.travel_repeat}.',
-                  f'Task: {self.args.deg}.'
-                 )
-            self.svd_based_ddnm_plus(model, cls_fn)
+            if simplified:
+                print('Run Simplified DDNM, without SVD.',
+                    f'{self.config.time_travel.T_sampling} sampling steps.',
+                    f'travel_length = {self.config.time_travel.travel_length},',
+                    f'travel_repeat = {self.config.time_travel.travel_repeat}.',
+                    f'Task: {self.args.deg}.'
+                    )
+                self.simplified_ddnm_plus(model, cls_fn)
+            else:
+                print('Run SVD-based DDNM.',
+                    f'{self.config.time_travel.T_sampling} sampling steps.',
+                    f'travel_length = {self.config.time_travel.travel_length},',
+                    f'travel_repeat = {self.config.time_travel.travel_repeat}.',
+                    f'Task: {self.args.deg}.'
+                    )
+                self.svd_based_ddnm_plus(model, cls_fn)
             
             
     def simplified_ddnm_plus(self, model, cls_fn):
@@ -649,6 +737,7 @@ class Diffusion(object):
         
         with open("output.txt", "a") as f:
             f.write(f"Exp: {self.args.path_y}_{self.args.deg}, steps: {self.args.step_nums}, PSNR: {avg_psnr:.3f}, SSIM: {avg_ssim:.3f}, Number of samples: {idx_so_far - idx_init}\n")
+    
     
     
 

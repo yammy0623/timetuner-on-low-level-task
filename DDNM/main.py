@@ -87,6 +87,7 @@ def parse_args_and_config():
     parser.add_argument("--input_root", type=str, default="/tmp2/ICML2025", help="The root folder of input images")
     # parser.add_argument("--eval_model_name", type=str, default="new_SR_2agent_A2C_10")
     parser.add_argument("--step_nums", type=int, default=5)
+    parser.add_argument("--timetuner", type=str, default="train")
     
 
     args = parser.parse_args()
@@ -165,7 +166,7 @@ def main():
     
     try:
         runner = Diffusion(args, config)
-        runner.sample(args.simplified)
+        runner.sample(args.simplified, args.timetuner)
     except Exception:
         logging.error(traceback.format_exc())
 

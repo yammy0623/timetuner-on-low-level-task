@@ -162,24 +162,26 @@ def get_dataset(args, config):
                 indices[int(num_items * 0.) :],
             )
             test_dataset = Subset(dataset, test_indices)
+            train_dataset = Subset(dataset, train_indices)
+            dataset = train_dataset
 
     elif config.data.dataset == 'ImageNet':
         # only use validation dataset here
         if config.data.subset_1k:
             print('here')        
         
-            from datasets.imagenet_subset import ImageDataset
+            from datasets.imagenet_subset import ImageDataset, ImageDatasetTest
             train_dataset = ImageDataset(os.path.join(args.input_root, 'ImageNet', 'train'),
                      image_size=config.data.image_size,
                      normalize=False)
-            test_dataset = ImageDataset(os.path.join(args.input_root, 'ImageNet', 'val'),
-                     image_size=config.data.image_size,
-                     normalize=False)
-            dataset = train_dataset
-            # dataset = ImageDataset(os.path.join(args.exp, 'datasets', 'imagenet', 'imagenet'),
-            #          os.path.join(args.exp, 'imagenet_val_1k.txt'),
+            # test_dataset = ImageDataset(os.path.join(args.input_root, 'ImageNet', 'val'),
             #          image_size=config.data.image_size,
             #          normalize=False)
+            dataset = train_dataset
+            test_dataset = ImageDatasetTest(os.path.join(args.input_root, 'ImageNet', 'imagenet'),
+                     os.path.join(args.input_root, 'imagenet_val_1k.txt'),
+                     image_size=config.data.image_size,
+                     normalize=False)
             # test_dataset = dataset
         elif config.data.out_of_dist:
             dataset = torchvision.datasets.ImageFolder(
