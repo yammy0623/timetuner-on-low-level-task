@@ -240,7 +240,7 @@ class Diffusion(object):
             step_fn_kwargs = dict(eta=args.eta)
             tune_type = 'sequential'
             lr=2e-3
-            total_iters=10
+            total_iters=500
 
             # 4. Optimize the preset timesteps with NFE = 10.
             
@@ -275,9 +275,93 @@ class Diffusion(object):
             torch.save(t_ratios, f"./t_ratios_{args.step_nums}.pt")
             
         elif timetuner == "val":
+            args, config, betas = self.args, self.config, self.betas
+            
             print("timetuner val")
-            t_ratios = torch.load(f"t_ratios_{args.step_nums}.pt")
+            from time_tuner import NoiseScheduleVP, model_wrapper, TimeTuner
 
+            # 1. Define the noise schedule.
+            noise_schedule = NoiseScheduleVP(schedule='discrete', betas=betas)
+
+            ## 2. Convert your discrete-time `model` to the continuous-time
+            ## noise prediction model. Here is an example for a diffusion model
+            ## `model` with the noise prediction type.
+            guidance_scale=1.
+            guidance_type='uncond'
+            classifier_fcn=cls_fn
+            model_kwargs=None
+            classifier_kwargs=None
+
+            model_fn_continuous = model_wrapper(
+                model,
+                noise_schedule,
+                model_type='noise',
+                guidance_type=guidance_type,
+                guidance_scale=guidance_scale,
+                classifier_fn=classifier_fcn,
+                model_kwargs=model_kwargs,
+                classifier_kwargs=classifier_kwargs,
+            )
+
+            # 3. Define TimeTuner for optimizing, together with the DDIM sampler.
+            time_tuner = TimeTuner(model_fn_continuous, noise_schedule)
+            
+            t_ratios = torch.load(f"t_ratios_{args.step_nums}.pt")
+            
+            
+            
+            def seed_worker(worker_id):
+                worker_seed = args.seed % 2 ** 32
+                np.random.seed(worker_seed)
+                random.seed(worker_seed)
+
+            g = torch.Generator()
+            g.manual_seed(args.seed)
+
+            train_dataset, test_dataset = get_dataset(args, config)
+            test_loader = data.DataLoader(
+                test_dataset,
+                batch_size=config.sampling.batch_size,
+                shuffle=True,
+                num_workers=config.data.num_workers,
+                worker_init_fn=seed_worker,
+                generator=g,
+            )
+
+            for x_orig, cls in enumerate(test_loader):
+                # x_orig = data_transform(config, x_orig)
+                # x_orig = inverse_data_transform(config, x_orig)
+                
+                x = torch.randn(
+                    1,
+                    config.data.channels,
+                    config.data.image_size,
+                    config.data.image_size,
+                    device=self.device,
+                )
+                x0_t = time_tuner.ddim_sample(x=x,
+                            num_steps=args.step_nums,
+                            t_ratios=t_ratios,
+                            eta=args.eta)
+                
+                
+                # tvu.save_image(
+                #     inverse_data_transform(config, x0_t),
+                #     os.path.join(f"x0.png")
+                # )
+                # x0_t = inverse_data_transform(config, x0_t)
+                # mse = torch.mean((x0_t.to(self.device) - x_orig) ** 2)
+                # psnr = 10 * torch.log10(1 / mse)
+                # ssim = structural_similarity(
+                #     x0_t.cpu().numpy(),
+                #     x_orig.cpu().numpy(),
+                #     win_size=21,
+                #     channel_axis=0,
+                #     data_range=1.0
+                # )
+
+                # print("psnr: %.3f, ssim: %.3f" % psnr, ssim)
+                # ccc
         else:
             if simplified:
                 print('Run Simplified DDNM, without SVD.',

@@ -355,6 +355,7 @@ class TimeTuner(object):
         t = t.expand((x.shape[0]))
         return self._model(x, t, condition, uncond_condition)
 
+    # single step denoising
     def ddim_step_fn(self,
                      x,
                      t,
@@ -407,6 +408,7 @@ class TimeTuner(object):
             dim=0)
         return timesteps.to(self.device), timesteps_prev.to(self.device)
 
+    # single image sampling
     @torch.no_grad()
     def ddim_sample(self,
                     x,
@@ -429,6 +431,7 @@ class TimeTuner(object):
 
         intermediates = {'x_t': [x], 'x0_pred': [x]}
         total_steps = timesteps.shape[0]
+        
 
         if verbose:
             iterator = tqdm(zip(timesteps, timesteps_prev, t_ratios),
@@ -436,6 +439,7 @@ class TimeTuner(object):
                             total=total_steps)
         else:
             iterator = zip(timesteps, timesteps_prev, t_ratios)
+        print("iterate")
         for t, t_prev, t_ratio in iterator:
             x, x0_pred = self.ddim_step_fn(x,
                                            t=t,
@@ -451,6 +455,7 @@ class TimeTuner(object):
             return x, intermediates
         return x
 
+    # train data to obtain t_ratio
     def optimize_timesteps(self,
                            data_loader,
                            step_fn,
