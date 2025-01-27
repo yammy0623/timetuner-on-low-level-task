@@ -7,7 +7,10 @@ from torch.autograd import Variable
 from torch.optim import Adam
 from tqdm import tqdm
 from tqdm import trange
-
+import numpy as np
+import torchvision.utils as tvu
+import os
+from datasets import get_dataset, data_transform, inverse_data_transform
 
 __all__ = ['NoiseScheduleVP', 'model_wrapper', 'TimeTuner']
 
@@ -104,6 +107,7 @@ class NoiseScheduleVP(object):
         if schedule == 'discrete':
             if betas is not None:
                 log_alphas = 0.5 * torch.log(1 - betas).cumsum(dim=0)
+                self.beta = betas
             else:
                 assert alphas_cumprod is not None
                 log_alphas = 0.5 * torch.log(alphas_cumprod)
@@ -148,7 +152,14 @@ class NoiseScheduleVP(object):
     def marginal_std(self, t):
         """Compute sigma_t of a given continuous-time label t in [0, T]."""
         return torch.sqrt(1. - torch.exp(2. * self.marginal_log_mean_coeff(t)))
-
+    
+    def comput_alpha_ddnm(self, t):
+        beta = torch.cat([torch.zeros(1).to(self.beta.device), self.beta], dim=0)
+        a = (1 - beta).cumprod(dim=0).index_select(0, t + 1).view(-1, 1, 1, 1)
+        return a
+    
+    def marginal_alpha_ddnm(self, t):
+        return self.comput_alpha_ddnm(t.long())
 
 def model_wrapper(
     model,
@@ -227,13 +238,17 @@ def model_wrapper(
         [1 / N, 1] to `t_input` in [0, 1000 * (N - 1) / N]. For continuous-time
         DPMs, we just use `t_continuous`.
         """
+        # only use schedule type in our case
         if noise_schedule.schedule == 'discrete':
-            return (t_continuous - 1. / noise_schedule.total_N) * 1000
+            out_t = (t_continuous - 1. / noise_schedule.total_N) * 1000
+            return out_t
         else:
             return t_continuous
 
     def noise_pred_fn(x, t_continuous, cond=None):
         t_input = get_model_input_time(t_continuous)
+        # print(t_input.item())
+        # t_seq.append(t_input)
         if cond is None:
             output = model(x, t_input, **model_kwargs)
         else:
@@ -269,8 +284,11 @@ def model_wrapper(
                                      **classifier_kwargs)
             return torch.autograd.grad(log_prob.sum(), x_in)[0]
 
+    
+    # 這邊會看noise pred fn 要 output 什麼
     def model_fn(x,
                  t_continuous,
+                #  t_seq,
                  condition=None,
                  unconditional_condition=None,):
         """The noise predicition model function for TimeTuner."""
@@ -292,7 +310,12 @@ def model_wrapper(
                                          t_input,
                                          cond=condition,
                                          **classifier_kwargs)
+                # from noise schedule
+                # DDNM
+                # sigma_t = (1 - at_next).sqrt()[0, 0, 0, 0]
+
                 sigma_t = noise_schedule.marginal_std(t_continuous)
+                # model predict
                 noise = noise_pred_fn(x,
                                     t_continuous,
                                     cond=condition,
@@ -322,6 +345,9 @@ def model_wrapper(
                                                     cond=c_in,
                                                     **model_kwargs).chunk(2)
                 return noise_uncond + guidance_scale * (noise - noise_uncond)
+        # elif guidance_type == "ddnm":
+        #     t_input = get_model_input_time(t_continuous)
+        #     return ddnm_fn(x, t_continuous, y, condition=condition)
 
     assert model_type in ['noise', 'x_start', 'v', 'score']
     assert guidance_type in ['uncond', 'classifier', 'classifier-free']
@@ -358,6 +384,7 @@ class TimeTuner(object):
     def noise_predition_fn(self, x, t, condition, uncond_condition, **kwargs):
         """Return the noise prediction model."""
         t = t.expand((x.shape[0]))
+        # print(t)
         return self._model(x, t, condition, uncond_condition)
 
     # single step denoising
@@ -447,6 +474,7 @@ class TimeTuner(object):
                             total=total_steps)
         else:
             iterator = zip(timesteps, timesteps_prev, t_ratios)
+        self.t_seq = []
         for t, t_prev, t_ratio in iterator:
             x, x0_pred = self.ddim_step_fn(x,
                                            t=t,
@@ -457,15 +485,160 @@ class TimeTuner(object):
                                            uncond_condition=uncond_condition)
             intermediates['x_t'].append(x)
             intermediates['x0_pred'].append(x0_pred)
-
+        print(self.t_seq)
         if return_intermediates:
             return x, intermediates
         return x
+    
+    # single image sampling
+    @torch.no_grad()
+    def ddnm_sample(self,
+                    x,
+                    args,
+                    config,
+                    A_funcs,
+                    y,
+                    classes,
+                    num_steps=None,
+                    timesteps=None,
+                    t_ratios=None,
+                    eta=0.,
+                    condition=None,
+                    uncond_condition=None,
+                    return_intermediates=False,
+                    verbose=False):
+        
+        timesteps, timesteps_prev = self.get_timesteps(num_steps, timesteps)
+        if t_ratios is None:
+            t_ratios = torch.ones_like(timesteps)
+        else:
+            assert timesteps.shape == t_ratios.shape
+            if not isinstance(t_ratios, torch.Tensor):
+                t_ratios = torch.tensor(t_ratios)
+            t_ratios = t_ratios.to(self.device)
+
+        intermediates = {'x_t': [x], 'x0_pred': [x]}
+        total_steps = timesteps.shape[0]
+
+        if verbose:
+            iterator = tqdm(zip(timesteps, timesteps_prev, t_ratios),
+                            desc='DDIM Sampler',
+                            total=total_steps)
+        else:
+            iterator = zip(timesteps, timesteps_prev, t_ratios)
+        
+        print(timesteps)
+        tvu.save_image(
+                inverse_data_transform(x),
+                os.path.join("images", f"start_x.png")
+            )
+        for t, t_prev, t_ratio in iterator:
+            x, x0_pred = self.ddnm_step_fn(x,
+                                           A_funcs,
+                                           y,
+                                           t=t,
+                                           s=t_prev,
+                                           t_ratio=t_ratio,
+                                           eta=eta,
+                                           condition=condition,
+                                           uncond_condition=uncond_condition)
+            intermediates['x_t'].append(x)
+            intermediates['x0_pred'].append(x0_pred)
+            tvu.save_image(
+                    inverse_data_transform(x0_pred),
+                    os.path.join("images", f"x0_pred.png")
+                )
+            tvu.save_image(
+                    inverse_data_transform(x),
+                    os.path.join("images", f"x_t.png")
+                )
+        if return_intermediates:
+            return x, intermediates
+        return x0_pred
+    
+    def ddnm_step_fn(self,
+                     x,
+                     A_funcs,
+                     y,
+                     t,
+                     s,
+                     t_ratio=1.,
+                     eta=0.,
+                     noise=None,
+                     condition=None,
+                     uncond_condition=None):
+        
+        # alpha_t = expand_dims(self.noise_schedule.marginal_alpha(t), x.dim())
+        # alpha_t_prev = expand_dims(self.noise_schedule.marginal_alpha(s),
+        #                            x.dim())
+        print("t = ", t)
+        print("s  = ", s)
+        alpha_t =  self.noise_schedule.marginal_alpha_ddnm(t)
+        alpha_t_prev =  self.noise_schedule.marginal_alpha_ddnm(s)
+        # print(f"x shape: {x.shape}")
+        # if cls_fn == None:
+        # eps = self.noise_predition_fn(x,
+        #                             t * t_ratio,
+        #                             condition,
+        #                             uncond_condition)
+        # else:
+        #     classes = torch.ones(xt.size(0), dtype=torch.long, device=torch.device("cuda"))*class_num
+        #     et = model(xt, t, classes)
+        #     et = et[:, :3]
+        #     et = et - (1 - at).sqrt()[0, 0, 0, 0] * cls_fn(x, t, classes)
+        eps = self.noise_predition_fn(x,
+                            t * t_ratio,
+                            condition,
+                            uncond_condition)
+        if eps.size(1) == 6:
+            eps = eps[:, :3]
+            
+        # print(f"alpha_t shape: {alpha_t.shape}")
+        # print(f"eps shape: {eps.shape}")
+
+        # sigma = (
+        #     eta *
+        #     torch.sqrt((1 - alpha_t_prev ** 2) / (1 - alpha_t ** 2)) *
+        #     torch.sqrt(1 - alpha_t ** 2 / alpha_t_prev ** 2))
+        
+        # denoise
+        x0_pred = (x - (1 - alpha_t ** 2).sqrt() * eps) / alpha_t
+        # add for ddnm
+        x0_pred_hat = x0_pred - A_funcs.A_pinv(
+            A_funcs.A(x0_pred.reshape(x0_pred.size(0), -1)) - y.reshape(y.size(0), -1)
+        ).reshape(*x0_pred.size())
+
+        c1 = (1 - alpha_t_prev).sqrt() * eta
+        c2 = (1 - alpha_t_prev).sqrt() * ((1 - eta ** 2) ** 0.5)
+        xt_next = alpha_t_prev.sqrt() * x0_pred_hat + c1 * torch.randn_like(x0_pred) + c2 * eps
+
+        tvu.save_image(
+                inverse_data_transform(x0_pred_hat),
+                os.path.join("images", f"x0_final.png")
+            )
+        # # add noise 
+        # if noise is not None:
+        #     assert noise.shape == x.shape
+        # else:
+        #     noise = torch.randn_like(x)
+        # mean_pred = (x0_pred * alpha_t_prev +
+        #              torch.sqrt(1 - alpha_t_prev ** 2 - sigma ** 2) * eps)
+
+        # # no noise when t == 0
+        # nonzero_mask = ((t != 0).float().view(-1, *([1] * (x.ndim - 1))))
+        # x = mean_pred + nonzero_mask * sigma * noise
+        x = xt_next
+
+
+        
+        return x, x0_pred_hat
 
     # train data to obtain t_ratio
     def optimize_timesteps(self,
                            data_loader,
                            step_fn,
+                           args,
+                           config, 
                            encode_fn=None,
                            num_steps=None,
                            timesteps=None,
@@ -474,13 +647,19 @@ class TimeTuner(object):
                            total_iters=500,
                            verbose=False,
                            **kwargs):
-        if tune_type not in ['sequential', 'parallel']:
+        if tune_type not in ['sequential', 'parallel', 'ddnm']:
             raise ValueError(f'Unsupported tune type {tune_type}. The tune '
                              f'type needs to be `sequential` or `parallel`!')
         t_ratios = list()
         timesteps, timesteps_prev = self.get_timesteps(num_steps, timesteps)
+        # print(timesteps)
+        # print(timesteps_prev)
+        deg = args.deg
         num_tuned_timesteps = len(timesteps) - 1
+
+        A_funcs, sigma_y = get_A_funcs_sigmay(args, config)
         for idx in trange(num_tuned_timesteps):
+
             t_ratio = Variable(torch.ones(1)).cuda()
             t_ratio.requires_grad = True
             optimizer = Adam([t_ratio], lr=lr, betas=(0.9, 0.999))
@@ -489,6 +668,25 @@ class TimeTuner(object):
                     break
                 # x = data_dict.get('image').to(self.device)
                 x = data_dict[0].to(self.device)
+                x_orig = data_transform(config, x)
+                y = A_funcs.A(x_orig)
+            
+                b, hwc = y.size()
+                if 'color' in deg:
+                    hw = hwc / 1
+                    h = w = int(hw ** 0.5)
+                    y = y.reshape((b, 1, h, w))
+                elif 'inp' in deg or 'cs' in deg:
+                    pass
+                else:
+                    hw = hwc / 3
+                    h = w = int(hw ** 0.5)
+                    y = y.reshape((b, 3, h, w))
+                    
+                if args.add_noise: # for denoising test
+                    y = get_gaussian_noisy_img(y, sigma_y) 
+                
+                y = y.reshape((b, hwc))
                 if encode_fn is not None:
                     x = encode_fn(x)
                 # c = data_dict.get('label', None)
@@ -498,6 +696,7 @@ class TimeTuner(object):
                 t = timesteps[idx]
                 t_prev = timesteps_prev[idx]
                 noise = torch.randn_like(x)
+                print(t)
 
                 with torch.no_grad():
                     if tune_type == 'sequential':
@@ -515,30 +714,70 @@ class TimeTuner(object):
                                                  condition=c,
                                                  **kwargs)
                         x_t = x_inter
+                    elif tune_type == 'ddnm':
+                        # step_fn = ddnm_fn
+
+                        T = torch.tensor(self.noise_schedule.T).cuda()
+                        alpha_T = self.noise_schedule.marginal_alpha_ddnm(T)
+                        # alpha_T = self.noise_schedule.marginal_alpha(T)
+                        # sigma_T = self.noise_schedule.marginal_std(T)
+                        x_inter = x * alpha_T.sqrt() + noise * (1-alpha_T).sqrt()
+                        x_inter = noise
+                        tvu.save_image(
+                            inverse_data_transform(x_inter),
+                            os.path.join("images", f"start_x.png")
+                        )
+                        for s, s_prev, ratio in zip(timesteps[:idx],
+                                                    timesteps_prev[:idx],
+                                                    t_ratios[:idx]):
+                            x_inter, x0_t= step_fn(x_inter,
+                                                 A_funcs,
+                                                 y,
+                                                 s,
+                                                 s_prev,
+                                                 ratio,
+                                                 condition=c,
+                                                 **kwargs)
+                            tvu.save_image(
+                                inverse_data_transform(x0_t),
+                                os.path.join("images", f"x0_t.png")
+                            )
+                        x_t = x_inter
+
+
                     else:
                         alpha_t = self.noise_schedule.marginal_alpha(t)
                         sigma_t = self.noise_schedule.marginal_std(t)
                         x_t = x * alpha_t + noise * sigma_t
+
                     eps_t = self.noise_predition_fn(x_t,
                                                     t,
                                                     condition=c,
                                                     uncond_condition=None,
                                                     **kwargs)
-                x_t_prev, _ = step_fn(x_t,
+                x_t_prev, x0_t_prev = step_fn(x_t,
+                                      A_funcs,
+                                      y,
                                       t=t,
                                       s=t_prev,
                                       t_ratio=t_ratio,
                                       condition=c,
                                       **kwargs)
+                tvu.save_image(
+                        inverse_data_transform(x0_t_prev),
+                        os.path.join("images", f"x0_t_prev.png")
+                    )
                 eps_t_prev = self.noise_predition_fn(x_t_prev,
                                                      t_prev,
                                                      condition=c,
                                                      uncond_condition=None,
                                                      **kwargs)
+                print(eps_t_prev)
                 loss = mean_flat((eps_t - eps_t_prev).square())
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                print(f"eps_t: {eps_t.mean().item()}, eps_t_prev: {eps_t_prev.mean().item()}")
 
                 if verbose:
                     msg = f'idx: {idx} / {num_tuned_timesteps}, '
@@ -549,6 +788,7 @@ class TimeTuner(object):
 
             t_ratios.append(t_ratio.detach().cpu().item())
             print(t_ratios)
+
 
         return torch.tensor(t_ratios + [1.])
 
@@ -622,3 +862,140 @@ def expand_dims(v, dims):
 
 def mean_flat(tensor):
     return tensor.sum(dim=list(range(1, tensor.ndim))).mean(dim=0)
+
+# function for ddnm
+
+def compute_alpha(beta, t):
+    beta = torch.cat([torch.zeros(1).to(beta.device), beta], dim=0)
+    a = (1 - beta).cumprod(dim=0).index_select(0, t + 1).view(-1, 1, 1, 1)
+    return a
+
+def inverse_data_transform(x):
+    x = (x + 1.0) / 2.0
+    return torch.clamp(x, 0.0, 1.0)
+
+
+def get_noisy_x(next_t, b, x0_t_hat):
+    next_t = next_t.to('cuda')
+    x0_t_hat = x0_t_hat.to('cuda')
+    at_next = compute_alpha(b, next_t.long())
+    xt_next = at_next.sqrt() * x0_t_hat + torch.randn_like(x0_t_hat) * (1 - at_next).sqrt()
+    return xt_next
+
+
+def get_A_funcs_sigmay(args, config):
+    deg = args.deg
+    A_funcs = None
+    device = 'cuda'
+    if deg == 'cs_walshhadamard':
+        compress_by = round(1/args.deg_scale)
+        from functions.svd_operators import WalshHadamardCS
+        A_funcs = WalshHadamardCS(config.data.channels, config.data.image_size, compress_by,
+                                torch.randperm(config.data.image_size ** 2, device=device), device)
+    elif deg == 'cs_blockbased':
+        cs_ratio = args.deg_scale
+        from functions.svd_operators import CS
+        A_funcs = CS(config.data.channels, config.data.image_size, cs_ratio, device)
+    elif deg == 'inpainting':
+        from functions.svd_operators import Inpainting
+        loaded = np.load("exp/inp_masks/mask.npy")
+        mask = torch.from_numpy(loaded).to(device).reshape(-1)
+        missing_r = torch.nonzero(mask == 0).long().reshape(-1) * 3
+        missing_g = missing_r + 1
+        missing_b = missing_g + 1
+        missing = torch.cat([missing_r, missing_g, missing_b], dim=0)
+        A_funcs = Inpainting(config.data.channels, config.data.image_size, missing, device)
+    elif deg == 'denoising':
+        from functions.svd_operators import Denoising
+        A_funcs = Denoising(config.data.channels, config.data.image_size, device)
+    elif deg == 'colorization':
+        from functions.svd_operators import Colorization
+        A_funcs = Colorization(config.data.image_size, device)
+    elif deg == 'sr_averagepooling':
+        blur_by = int(args.deg_scale)
+        from functions.svd_operators import SuperResolution
+        A_funcs = SuperResolution(config.data.channels, config.data.image_size, blur_by, self.device)
+    elif deg == 'sr_bicubic':
+        factor = int(args.deg_scale)
+        from functions.svd_operators import SRConv
+        def bicubic_kernel(x, a=-0.5):
+            if abs(x) <= 1:
+                return (a + 2) * abs(x) ** 3 - (a + 3) * abs(x) ** 2 + 1
+            elif 1 < abs(x) and abs(x) < 2:
+                return a * abs(x) ** 3 - 5 * a * abs(x) ** 2 + 8 * a * abs(x) - 4 * a
+            else:
+                return 0
+        k = np.zeros((factor * 4))
+        for i in range(factor * 4):
+            x = (1 / factor) * (i - np.floor(factor * 4 / 2) + 0.5)
+            k[i] = bicubic_kernel(x)
+        k = k / np.sum(k)
+        kernel = torch.from_numpy(k).float().to(device)
+        A_funcs = SRConv(kernel / kernel.sum(), \
+                        config.data.channels,config.data.image_size, device, stride=factor)
+    elif deg == 'deblur_uni':
+        from functions.svd_operators import Deblurring
+        A_funcs = Deblurring(torch.Tensor([1 / 9] * 9).to(device), config.data.channels,
+                            config.data.image_size, device)
+    elif deg == 'deblur_gauss':
+        from functions.svd_operators import Deblurring
+        sigma = 10
+        pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x / sigma) ** 2]))
+        kernel = torch.Tensor([pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2)]).to(self.device)
+        A_funcs = Deblurring(kernel / kernel.sum(), config.data.channels, self.config.data.image_size, self.device)
+    elif deg == 'deblur_aniso':
+        from functions.svd_operators import Deblurring2D
+        sigma = 20
+        pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x / sigma) ** 2]))
+        kernel2 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(
+            device)
+        sigma = 1
+        pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x / sigma) ** 2]))
+        kernel1 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(
+            device)
+        A_funcs = Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels,
+                            config.data.image_size, device)
+    else:
+        raise ValueError("degradation type not supported")
+    args.sigma_y = 2 * args.sigma_y #to account for scaling to [-1,1]
+    sigma_y = args.sigma_y
+
+    return A_funcs, sigma_y
+
+def get_y_from_x(A_funcs, deg, sigma_y, config, args):
+    x_orig = data_transform(config, x_orig)
+
+    y = A_funcs.A(x_orig)
+
+    b, hwc = y.size()
+    if 'color' in deg:
+        hw = hwc / 1
+        h = w = int(hw ** 0.5)
+        y = y.reshape((b, 1, h, w))
+    elif 'inp' in deg or 'cs' in deg:
+        pass
+    else:
+        hw = hwc / 3
+        h = w = int(hw ** 0.5)
+        y = y.reshape((b, 3, h, w))
+        
+    if args.add_noise: # for denoising test
+        y = get_gaussian_noisy_img(y, sigma_y) 
+    
+    y = y.reshape((b, hwc))
+
+    Apy = A_funcs.A_pinv(y).view(y.shape[0], config.data.channels, config.data.image_size,
+                                        config.data.image_size)
+    x = Apy
+
+    if deg[:6] == 'deblur':
+        Apy = y.view(y.shape[0], config.data.channels, config.data.image_size,
+                            config.data.image_size)
+    elif deg == 'colorization':
+        Apy = y.view(y.shape[0], 1, config.data.image_size, config.data.image_size).repeat(1,3,1,1)
+    elif deg == 'inpainting':
+        Apy += A_funcs.A_pinv(A_funcs.A(torch.ones_like(Apy))).reshape(*Apy.shape) - 1
+
+
+def get_gaussian_noisy_img(img, noise_level):
+    return img + torch.randn_like(img).cuda() * noise_level
