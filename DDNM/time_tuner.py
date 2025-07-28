@@ -696,7 +696,6 @@ class TimeTuner(object):
                 t = timesteps[idx]
                 t_prev = timesteps_prev[idx]
                 noise = torch.randn_like(x)
-                print(t)
 
                 with torch.no_grad():
                     if tune_type == 'sequential':

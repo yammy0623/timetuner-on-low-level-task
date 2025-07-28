@@ -511,6 +511,7 @@ class TimeTuner(object):
                         alpha_t = self.noise_schedule.marginal_alpha(t)
                         sigma_t = self.noise_schedule.marginal_std(t)
                         x_t = x * alpha_t + noise * sigma_t
+                        
                     eps_t = self.noise_predition_fn(x_t,
                                                     t,
                                                     condition=c,
